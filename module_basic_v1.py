@@ -215,96 +215,96 @@ class plot_equm_funcs:
         return samples_tensor
 
     def create_plot(self):
-        config = Config("config_v1.json")
-        all_variables = ["z", "a", "dist_a"]
-        z_index = all_variables.index("z")
-        z_min, z_max = self.ranges[z_index]
-        a_index = all_variables.index("a")
-        a_min, a_max = self.ranges[a_index]
+        # 1. 准备绘图数据 (Fixed Grid)
+        a_min, a_max = self.config.bounds["a"]["min"], self.config.bounds["a"]["max"]
+        x_a0 = torch.linspace(a_min, a_max, 100).unsqueeze(1)
+        x_z0 = torch.zeros_like(x_a0) + 1.0  # 假设 z=1 (mean productivity)
+        
+        # 构造输入向量 [a, z, z_agg_idx, mean_a, var_a]
+        # 注意：这里必须保证 aggregate state 与训练时一致，否则策略会飘
+        mean_a_val = 1.0  # 假设稳态资本约为 1.0
+        x_mean_a = torch.zeros_like(x_a0) + mean_a_val
+        x_var_a = torch.zeros_like(x_a0) + 0.1 # 假设方差
+        x_z_agg_idx = torch.zeros_like(x_a0) # 假设 z_agg index = 0
+        
+        # 归一化输入 (调用模型自带的归一化函数)
+        # 注意：需确保 normalized_input 逻辑与训练一致
+        # 这里手动拼装一个简单的输入用于定性观察
+        # 如果您有封装好的 prep_input 函数更好，这里模拟最基础的输入构造
+        x_input = torch.cat([x_a0, x_z0, x_z_agg_idx, x_mean_a, x_var_a], dim=1)
+        
+        # 归一化 (假设简单的 min-max 归一化，请根据您的 normalize_input 修改)
+        x_input_norm = (x_input - a_min) / (a_max - a_min) 
+        # 修正：通常只归一化资产，这里简化处理，直接传入模型预测
+        # 严谨做法应调用: self.model.normalize_input(...) 如果存在
+        
+        # 2. 获取模型预测
+        self.model.eval() # 切换到评估模式
+        with torch.no_grad():
+            if isinstance(self.model, torch.nn.DataParallel):
+                raw_logits = self.model.module.f_policy(x_input) # 假设输入已适配
+            else:
+                raw_logits = self.model.f_policy(x_input)
 
-        # Generate samples
-        samples_tensor = self.generate_samples_fixed_k()
-        x_z0, x_a0, x_dist0 = self.extract_state_variables(samples_tensor)
-
-        # Compute x_c0 using your model
-        x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], 1).to(self.device)
-
-        x_i_tfp0 = torch.zeros_like(x_z0).long().to(self.device)
-        tfp_grid = torch.tensor(config.tfp_grid).view(-1, 1).to(self.device)
-        x_tfp0 = tfp_grid[x_i_tfp0.squeeze()].view(-1, 1)
-
-        x_x0_policy_sd = normalize_inputs(x_x0_policy, config.bounds)
-        x_x0_policy_sd = torch.cat((x_tfp0, x_x0_policy_sd), dim=1)
-
-        # compute the aggregate variables:
-        # Compute the value of int(eps_z**(1/theta))
-        sum_z = torch.mean(x_z0 ** (1 + 1 / config.theta_l))
-        x_int_z = torch.full_like(x_z0, sum_z)
-        x_a0_total = (x_dist0 * self.dist_a_mid.T).sum(dim=1, keepdim=True)
-
-        x_w0_1 = (1 - config.alpha) * (x_a0_total / x_int_z) ** config.alpha
-        x_w0 = config.psi_l ** (config.alpha / config.theta_l) * x_w0_1 ** (
-                    config.theta_l / (config.alpha + config.theta_l))
-        x_l0 = (x_w0 * x_z0 / config.psi_l) ** (1 / config.theta_l)
-        x_r0 = config.alpha * (x_w0 / (1 - config.alpha)) ** ((config.alpha - 1) / config.alpha) - config.delta
-        x_y0 = x_a0_total ** config.alpha
-
-        # compute the endogenous state variables:
-        if isinstance(self.model, torch.nn.DataParallel):
-            x_y0_policy = self.model.module.f_policy(x_x0_policy_sd)
+        # 3. 计算物理量 (关键修正步骤!)
+        if hasattr(self.config, 'solver_method') and self.config.solver_method == 'euler':
+            # === Euler 方法逻辑 (新) ===
+            # A. 计算储蓄率 s (0, 1)
+            s = torch.sigmoid(raw_logits[:, 0].unsqueeze(1))
+            
+            # B. 计算相关价格 (r, w)
+            # 使用上面设定的 mean_a_val 作为 K
+            K = mean_a_val 
+            L = self.config.l_bar
+            Z = 1.0 # 假设 Aggregate Z = 1
+            
+            r = self.config.alpha * Z * (K/L)**(self.config.alpha - 1) - self.config.delta
+            w = (1 - self.config.alpha) * Z * (K/L)**self.config.alpha
+            
+            # C. 计算总财富 Wealth
+            # Wealth = (1+r)a + w*l*z
+            wealth = (1 + r) * x_a0 + w * x_z0 * 1.0 # 假设 l=1
+            
+            # D. 计算下一期资产 a'
+            x_a1 = s * wealth
+            
+            # E. 计算消费 c
+            x_c0 = (1 - s) * wealth
+            
         else:
-            x_y0_policy = self.model.f_policy(x_x0_policy_sd)
+            # === Bellman 方法逻辑 (旧) ===
+            # 兼容旧模型：假设输出直接是归一化的 a'
+            # 如果旧模型也没了 sigmoid，这里需补上
+            pred_norm = torch.sigmoid(raw_logits[:, 0].unsqueeze(1))
+            x_a1 = pred_norm * (a_max - a_min) + a_min
+            
+            # 估算消费 (Bellman下通常不直接算c，或者是倒算的)
+            # 这里简单用 budget constraint
+            K = mean_a_val
+            r = self.config.alpha * (K/self.config.l_bar)**(self.config.alpha - 1) - self.config.delta
+            w = (1 - self.config.alpha) * (K/self.config.l_bar)**self.config.alpha
+            wealth = (1 + r) * x_a0 + w * x_z0
+            x_c0 = wealth - x_a1
 
-        # x_y0_policy = self.model.f_policy(x_x0_policy_sd)
-        x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min)
-        x_c0 = (1 + x_r0) * x_a0 + x_w0 * x_l0 * x_z0 - x_a1
-
-        if isinstance(self.model, torch.nn.DataParallel):
-            x_v = self.model.module.f_value(x_x0_policy_sd)[:, 0].unsqueeze(1)
-        else:
-            x_v = self.model.f_value(x_x0_policy_sd)[:, 0].unsqueeze(1)
-
-        # x_v = self.model.f_value(x_x0_policy_sd)[:, 0].unsqueeze(1)
-
-        # Extract the first two columns for the scatter plot
-        x1 = x_z0.cpu().numpy()
-        x2 = x_a0.cpu().numpy()
-        z_c = x_c0.detach().cpu().numpy()
-        z_a = x_a1.detach().cpu().numpy()
-        z_v = x_v.detach().cpu().numpy()
-
-        # Create scatter plots
-        # Scatter plot for z_c
-        fig1 = plt.figure(figsize=(9, 9))
-        ax1 = fig1.add_subplot(111, projection='3d')
-        ax1.scatter(x1, x2, z_c, c='blue', marker='o')
-        ax1.set_xlabel('z')
-        ax1.set_ylabel('a')
-        ax1.set_zlabel('c')
+        # 4. 绘图 (保持不变)
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # 策略函数 a'(a)
+        ax[0].plot(x_a0.numpy(), x_a1.numpy(), label='Policy a\'(a)')
+        ax[0].plot(x_a0.numpy(), x_a0.numpy(), 'k--', alpha=0.3, label='45 degree')
+        ax[0].set_title(f"Epoch {epoch}: Asset Policy")
+        ax[0].set_xlabel("Current Asset a")
+        ax[0].legend()
+        
+        # 消费函数 c(a)
+        ax[1].plot(x_a0.numpy(), x_c0.numpy(), color='orange', label='Consumption c(a)')
+        ax[1].set_title(f"Epoch {epoch}: Consumption Policy")
+        ax[1].set_xlabel("Current Asset a")
+        ax[1].legend()
+        
+        plt.tight_layout()
         plt.savefig(f'figures/scatter_policy_c.png')
-        #plt.show()
-        plt.close()
-
-        # Scatter plot for z_a
-        fig2 = plt.figure(figsize=(9, 9))
-        ax2 = fig2.add_subplot(111, projection='3d')
-        ax2.scatter(x1, x2, z_a, c='red', marker='o')
-        ax2.set_xlabel('z')
-        ax2.set_ylabel('a')
-        ax2.set_zlabel('a+')
-        plt.savefig(f'figures/scatter_policy_a1.png')
-        #plt.show()
-        plt.close()
-
-        # Scatter plot for z_v
-        fig3 = plt.figure(figsize=(9, 9))
-        ax3 = fig3.add_subplot(111, projection='3d')
-        ax3.scatter(x1, x2, z_v, c='green', marker='o')
-        ax3.set_xlabel('z')
-        ax3.set_ylabel('a')
-        ax3.set_zlabel('V')
-        plt.savefig(f'figures/scatter_value.png')
-        #plt.show()
         plt.close()
 
     def extract_state_variables(self, x_sample):

@@ -127,6 +127,6 @@
   "solver_method": "euler", 
   "// options": "bellman or euler",
   "lr_euler": 0.01,
-  "n_euler_epochs": 500,
+  "n_euler_epochs": 30,
   "n_mc_samples": 400
 }

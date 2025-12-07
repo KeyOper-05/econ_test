@@ -359,12 +359,41 @@ class define_objective:
             x_r0_path.append(x_r0)
             x_y0_path.append(x_y0)
 
+            # 1. 获取模型原始输出 (Raw Logits)
             if isinstance(self.model, torch.nn.DataParallel):
-                x_y0_policy = self.model.module.f_policy(x_x0_policy_sd)
+                raw_logits = self.model.module.f_policy(x_x0_policy_sd)
             else:
-                x_y0_policy = self.model.f_policy(x_x0_policy_sd)
+                raw_logits = self.model.f_policy(x_x0_policy_sd)
 
-            x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min)
+            # 2. 根据求解方法计算下一期资产 x_a1
+            # 检查 config 是否配置为 euler 方法
+            if hasattr(config, 'solver_method') and config.solver_method == 'euler':
+                # === Euler 方法修正逻辑 ===
+                # (1) 激活储蓄率 s in (0, 1)
+                s = torch.sigmoid(raw_logits[:, 0].unsqueeze(1))
+                
+                # (2) 计算当前财富 (Cash on Hand)
+                # Wealth = (1+r)*a + w*l*z
+                wealth = (1 + x_r0) * x_a0 + x_w0 * x_l0 * x_z0
+                
+                # (3) 计算下一期资产 a' = s * wealth
+                x_a1 = s * wealth
+                
+                # (4) 施加硬约束 (防止数值误差导致越界)
+                x_a1 = torch.clamp(x_a1, min=a_min, max=a_max)
+                
+            else:
+                # === Bellman 方法 (旧逻辑) ===
+                # 假设输出是归一化资产，或者如果您在 Bellman 模型里也删了 Sigmoid，这里需要补上
+                # 为了兼容性，这里假设 Bellman 模型输出直接对应归一化资产
+                # 如果 Bellman 模型也输出了 Logits，请加上 torch.sigmoid(raw_logits[:, 0]...)
+                
+                # 简单处理：假设 Bellman 模型仍需要 Sigmoid 映射回 [0,1] (如果之前删了的话)
+                pred_norm = torch.sigmoid(raw_logits[:, 0].unsqueeze(1))
+                x_a1 = pred_norm * (a_max - a_min) # + a_min (a_min通常为0)
+
+            # 3. 计算消费 (用于记录或惩罚计算)
+            # 注意：对于 Euler 方法，消费其实就是 (1-s)*wealth，也就是 wealth - x_a1
             x_c0 = (1 + x_r0) * x_a0 + x_w0 * x_l0 * x_z0 - x_a1
 
             z_lower_bound, z_upper_bound = config.get_z_bounds()
