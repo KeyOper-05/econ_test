@@ -51,7 +51,6 @@ class MyModel(nn.Module):
             nn.Linear(n1_p, n2_p),
             nn.ReLU(),
             nn.Linear(n2_p, n_p_output),
-            nn.Sigmoid()
         )
 
         # Define value function
